@@ -196,6 +196,10 @@ class DatabaseMacaroonService:
         for caveat in scopes:
             m.add_first_party_caveat(caveats.serialize(caveat))
         serialized_macaroon = f"pypi-{m.serialize()}"
+
+        # This prefix is used by our secret scanning partners.
+        assert serialized_macaroon.startswith("pypi-AgEIcHlwaS5vcmc")
+
         return serialized_macaroon, dm
 
     def delete_macaroon(self, macaroon_id):
