@@ -275,6 +275,20 @@ def test_includeme():
             domain=warehouse,
         ),
         pretend.call(
+            "admin.project.release.delete",
+            "/admin/projects/{project_name}/release/{version}/delete/",
+            factory="warehouse.packaging.models:ProjectFactory",
+            traverse="/{project_name}/{version}",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "admin.project.release.file.delete",
+            "/admin/projects/{project_name}/release/{version}/delete_file/",
+            factory="warehouse.packaging.models:ProjectFactory",
+            traverse="/{project_name}/{version}",
+            domain=warehouse,
+        ),
+        pretend.call(
             "admin.project.observations",
             "/admin/projects/{project_name}/observations/",
             factory="warehouse.packaging.models:ProjectFactory",
@@ -399,6 +413,11 @@ def test_includeme():
             domain=warehouse,
         ),
         pretend.call(
+            "admin.prohibited_project_names.ultranorm_release",
+            "/admin/prohibited_project_names/ultranorm_release/",
+            domain=warehouse,
+        ),
+        pretend.call(
             "admin.prohibited_user_names.list",
             "/admin/prohibited_user_names/",
             domain=warehouse,
@@ -505,6 +524,26 @@ def test_includeme():
         pretend.call(
             "admin.malware_reports.detail.verdict_remove_malware",
             "/admin/malware_reports/{observation_id}/remove_malware/",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "admin.vulnerabilities.list",
+            "/admin/vulnerabilities/",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "admin.vulnerabilities.bulk_delete",
+            "/admin/vulnerabilities/bulk_delete/",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "admin.vulnerabilities.detail",
+            "/admin/vulnerabilities/{source}/{id}/",
+            domain=warehouse,
+        ),
+        pretend.call(
+            "admin.vulnerabilities.detail.delete",
+            "/admin/vulnerabilities/{source}/{id}/delete/",
             domain=warehouse,
         ),
         pretend.call("admin.emails.list", "/admin/emails/", domain=warehouse),

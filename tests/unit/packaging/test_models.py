@@ -164,6 +164,7 @@ class TestProject:
                     Permissions.AdminProjectsWrite,
                     Permissions.AdminRoleAdd,
                     Permissions.AdminRoleDelete,
+                    Permissions.AdminVulnerabilitiesRead,
                 ),
             ),
             (
@@ -268,7 +269,9 @@ class TestProject:
             team=team, project=project, role_name=TeamProjectRoleType.Owner
         )
 
-        publisher = GitHubPublisherFactory.create(projects=[project])
+        # Publishers should not appear in the ACLs, since quarantined
+        # projects should not allow uploads from trusted publishers
+        GitHubPublisherFactory.create(projects=[project])
 
         acls = [item for location in lineage(project) for item in location.__acl__()]
 
@@ -292,6 +295,7 @@ class TestProject:
                     Permissions.AdminProjectsWrite,
                     Permissions.AdminRoleAdd,
                     Permissions.AdminRoleDelete,
+                    Permissions.AdminVulnerabilitiesRead,
                 ),
             ),
             (
@@ -318,9 +322,6 @@ class TestProject:
                 Permissions.SubmitMalwareObservation,
             ),
         ] + sorted(
-            [(Allow, f"oidc:{publisher.id}", [Permissions.ProjectsUpload])],
-            key=lambda x: x[1],
-        ) + sorted(
             [
                 (Allow, f"user:{owner1.user.id}", _perms_read_and_upload),
                 (Allow, f"user:{owner2.user.id}", _perms_read_and_upload),
@@ -384,6 +385,7 @@ class TestProject:
                     Permissions.AdminProjectsWrite,
                     Permissions.AdminRoleAdd,
                     Permissions.AdminRoleDelete,
+                    Permissions.AdminVulnerabilitiesRead,
                 ),
             ),
             (
@@ -920,6 +922,7 @@ class TestRelease:
                     Permissions.AdminProjectsWrite,
                     Permissions.AdminRoleAdd,
                     Permissions.AdminRoleDelete,
+                    Permissions.AdminVulnerabilitiesRead,
                 ),
             ),
             (

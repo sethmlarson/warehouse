@@ -8,8 +8,6 @@ import tarfile
 import tempfile
 import zipfile
 
-from cgi import FieldStorage
-
 import packaging.requirements
 import packaging.specifiers
 import packaging.utils
@@ -46,7 +44,9 @@ from warehouse.email import (
 )
 from warehouse.events.tags import EventTag
 from warehouse.forklift import metadata
+from warehouse.forklift.decorators import ensure_uploads_allowed, sanitize
 from warehouse.forklift.forms import UploadForm, _filetype_extension_mapping
+from warehouse.forklift.utils import _exc_with_message
 from warehouse.macaroons.models import Macaroon
 from warehouse.packaging.interfaces import IFileStorage, IProjectService
 from warehouse.packaging.metadata_verification import verify_email, verify_url
@@ -183,6 +183,10 @@ _jointlinux_arches = {
 _manylinux_arches = _jointlinux_arches | {"ppc64"}
 _musllinux_arches = _jointlinux_arches
 
+_pyemscripten_platform_re = re.compile(
+    r"pyemscripten_(?P<major>\d+)_(?P<minor>\d+)_wasm32"
+)
+
 
 # Actual checking code;
 def _valid_platform_tag(platform_tag):
@@ -214,27 +218,15 @@ def _valid_platform_tag(platform_tag):
     m = _android_platform_re.match(platform_tag)
     if m and m.group("arch") in _android_arches:
         return True
+    m = _pyemscripten_platform_re.match(platform_tag)
+    if m:
+        return True
     return False
 
 
 _error_message_order = ["metadata-version", "name", "version"]
 
 _dist_file_re = re.compile(r".+?(?P<extension>\.(tar\.gz|zip|whl))$", re.I)
-
-
-def _exc_with_message(exc, message, **kwargs):
-    if not message:
-        sentry_sdk.capture_message("Attempting to _exc_with_message without a message")
-
-    # The crappy old API that PyPI offered uses the status to pass down
-    # messages to the client. So this function will make that easier to do.
-    resp = exc(detail=message, **kwargs)
-    # We need to guard against characters outside of iso-8859-1 per RFC.
-    # Specifically here, where user-supplied text may appear in the message,
-    # which our WSGI server may not appropriately handle (indeed gunicorn does not).
-    status_message = message.encode("iso-8859-1", "replace").decode("iso-8859-1")
-    resp.status = f"{resp.status_code} {status_message}"
-    return resp
 
 
 def _construct_dependencies(meta: metadata.Metadata, types):
@@ -286,13 +278,17 @@ def _validate_filename(filename, filetype):
         )
 
 
-def _is_valid_dist_file(filename, filetype, *, scan=True):
+def _is_valid_dist_file(filename, filetype, metrics, *, scan=True):
     """
     Perform some basic checks to see whether the indicated file could be
     a valid distribution file.
 
     Runs a YARA scan on archive members while the archive is already open.
     Returns ``(False, message)`` on the first YARA match.
+
+    ``metrics`` is used to time the YARA scan and (for sdists) the tarfile
+    name enumeration, both of which do CPU-bound work synchronously inside
+    the upload request.
     """
     is_zipfile = bool(filename and zipfile.is_zipfile(filename))
     is_tarfile = bool(filename and tarfile.is_tarfile(filename))
@@ -368,6 +364,8 @@ def _is_valid_dist_file(filename, filetype, *, scan=True):
                     yara_match = scanner.check_members(
                         scanner.iter_zip_members(zfp),
                         archive_name=os.path.basename(filename),
+                        archive_type="zip",
+                        metrics=metrics,
                     )
                     if yara_match is not None:
                         sentry_sdk.capture_message(
@@ -398,7 +396,8 @@ def _is_valid_dist_file(filename, filetype, *, scan=True):
             with tarfile.open(filename, "r:gz") as tar:
                 # This decompresses the entire stream to validate it and the
                 # tar within.  Easy CPU DoS attack. :/
-                top_level = _commonpath(tar.getnames())
+                with metrics.timed("warehouse.upload.tarfile.getnames"):
+                    top_level = _commonpath(tar.getnames())
                 if top_level in [".", "/", ""]:
                     return (
                         False,
@@ -415,6 +414,8 @@ def _is_valid_dist_file(filename, filetype, *, scan=True):
                     yara_match = scanner.check_members(
                         scanner.iter_tar_members(tar),
                         archive_name=os.path.basename(filename),
+                        archive_type="tar",
+                        metrics=metrics,
                     )
                     if yara_match is not None:
                         sentry_sdk.capture_message(
@@ -473,6 +474,10 @@ def _sort_releases(request: Request, project: Project):
                 Release._pypi_ordering,
             )
         )
+        # Acquire row locks in a deterministic order (by PK) to prevent deadlocks
+        # when concurrent uploads to the same project both run _sort_releases.
+        .with_for_update()
+        .order_by(Release.id)
         .all()
     )
     for i, r in enumerate(
@@ -516,6 +521,7 @@ def _commonpath(values):
     require_methods=["POST"],
     has_translations=True,
     permit_duplicate_post_keys=True,
+    decorator=[sanitize, ensure_uploads_allowed],
 )
 def file_upload(request):
     # Log an attempt to upload
@@ -524,93 +530,6 @@ def file_upload(request):
     # This is a list of warnings that we'll emit *IF* the request is successful.
     warnings: list[str] = []
 
-    # If we're in read-only mode, let upload clients know
-    if request.flags.enabled(AdminFlagValue.READ_ONLY):
-        request.metrics.increment("warehouse.upload.failed", tags=["reason:read-only"])
-        raise _exc_with_message(
-            HTTPForbidden, "Read-only mode: Uploads are temporarily disabled."
-        )
-
-    if request.flags.enabled(AdminFlagValue.DISALLOW_NEW_UPLOAD):
-        request.metrics.increment(
-            "warehouse.upload.failed", tags=["reason:uploads-disabled"]
-        )
-        raise _exc_with_message(
-            HTTPForbidden,
-            "New uploads are temporarily disabled. "
-            "See {projecthelp} for more information.".format(
-                projecthelp=request.help_url(_anchor="admin-intervention")
-            ),
-        )
-
-    # Before we do anything, if there isn't an authenticated identity with
-    # this request, then we'll go ahead and bomb out.
-    if request.identity is None:
-        request.metrics.increment(
-            "warehouse.upload.failed", tags=["reason:no-identity"]
-        )
-        raise _exc_with_message(
-            HTTPForbidden,
-            "Invalid or non-existent authentication information. "
-            "See {projecthelp} for more information.".format(
-                projecthelp=request.help_url(_anchor="invalid-auth")
-            ),
-        )
-
-    # These checks only make sense when our authenticated identity is a user,
-    # not a project identity (like OIDC-minted tokens.)
-    if request.user:
-        # Ensure that user has a verified, primary email address. This should both
-        # reduce the ease of spam account creation and activity, as well as act as
-        # a forcing function for https://github.com/pypa/warehouse/issues/3632.
-        # TODO: Once https://github.com/pypa/warehouse/issues/3632 has been solved,
-        #       we might consider a different condition, possibly looking at
-        #       User.is_active instead.
-        if not (request.user.primary_email and request.user.primary_email.verified):
-            request.metrics.increment(
-                "warehouse.upload.failed", tags=["reason:unverified-email"]
-            )
-            raise _exc_with_message(
-                HTTPBadRequest,
-                (
-                    "User {!r} does not have a verified primary email address. "
-                    "Please add a verified primary email before attempting to "
-                    "upload to PyPI. See {project_help} for more information."
-                ).format(
-                    request.user.username,
-                    project_help=request.help_url(_anchor="verified-email"),
-                ),
-            ) from None
-        # Ensure user has enabled 2FA before they can upload a file.
-        if not request.user.has_two_factor:
-            request.metrics.increment("warehouse.upload.failed", tags=["reason:no-2fa"])
-            raise _exc_with_message(
-                HTTPBadRequest,
-                (
-                    "User {!r} does not have two-factor authentication enabled. "
-                    "Please enable two-factor authentication before attempting to "
-                    "upload to PyPI. See {project_help} for more information."
-                ).format(
-                    request.user.username,
-                    project_help=request.help_url(_anchor="two-factor-authentication"),
-                ),
-            ) from None
-
-    # Do some cleanup of the various form fields
-    for key in list(request.POST):
-        value = request.POST.get(key)
-        if isinstance(value, str):
-            # distutils "helpfully" substitutes unknown, but "required" values
-            # with the string "UNKNOWN". This is basically never what anyone
-            # actually wants so we'll just go ahead and delete anything whose
-            # value is UNKNOWN.
-            if value.strip() == "UNKNOWN":
-                del request.POST[key]
-
-            # Escape NUL characters, which psycopg doesn't like
-            if "\x00" in value:
-                request.POST[key] = value.replace("\x00", "\\x00")
-
     # We require protocol_version 1, it's the only supported version however
     # passing a different version should raise an error.
     if request.POST.get("protocol_version", "1") != "1":
@@ -618,20 +537,6 @@ def file_upload(request):
             "warehouse.upload.failed", tags=["reason:unsupported-protocol-version"]
         )
         raise _exc_with_message(HTTPBadRequest, "Unknown protocol version.")
-
-    # Check if any fields were supplied as a tuple and have become a
-    # FieldStorage. The 'content' field _should_ be a FieldStorage, however,
-    # and we don't care about the legacy gpg_signature field.
-    # ref: https://github.com/pypi/warehouse/issues/2185
-    # ref: https://github.com/pypi/warehouse/issues/2491
-    for field in set(request.POST) - {"content", "gpg_signature"}:
-        values = request.POST.getall(field)
-        if any(isinstance(value, FieldStorage) for value in values):
-            request.metrics.increment(
-                "warehouse.upload.failed",
-                tags=["reason:field-is-tuple", f"field:{field}"],
-            )
-            raise _exc_with_message(HTTPBadRequest, f"{field}: Should not be a tuple.")
 
     # Validate and process the incoming file data.
     form = UploadForm(request.POST)
@@ -1248,11 +1153,16 @@ def file_upload(request):
 
         # Check the file to make sure it is a valid distribution file.
         _scan = not request.flags.enabled(AdminFlagValue.DISABLE_UPLOAD_SCANNING)
-        _valid, _msg = _is_valid_dist_file(
-            temporary_filename,
-            form.filetype.data,
-            scan=_scan,
-        )
+        with request.metrics.timed(
+            "warehouse.upload.validate",
+            tags=[f"filetype:{form.filetype.data}"],
+        ):
+            _valid, _msg = _is_valid_dist_file(
+                temporary_filename,
+                form.filetype.data,
+                request.metrics,
+                scan=_scan,
+            )
         if not _valid:
             request.metrics.increment(
                 "warehouse.upload.failed",
